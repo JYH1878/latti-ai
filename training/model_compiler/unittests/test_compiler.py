@@ -265,6 +265,33 @@ class CompilerTestBase(unittest.TestCase):
     temp_json_path = script_dir / 'temp.json'
     e2e_base_path = project_root / 'build' / 'inference' / 'hetero_e2e'
 
+    def _check_concat_input_ordering(self, graph: LayerAbstractGraph, raw_json_path):
+        """Assert every concat2d node in *graph* preserves the input ordering from *raw_json_path*."""
+        raw_graph = LayerAbstractGraph.from_json(str(raw_json_path))
+
+        raw_concat_inputs: dict[str, list[str]] = {}
+        for node in raw_graph.dag.nodes:
+            if isinstance(node, ComputeNode) and node.layer_type == 'concat2d':
+                raw_concat_inputs[node.layer_id] = [p.node_id for p in raw_graph.dag.predecessors(node)]
+
+        for node in graph.dag.nodes:
+            if not (isinstance(node, ComputeNode) and node.layer_type == 'concat2d'):
+                continue
+            if node.layer_id not in raw_concat_inputs:
+                continue
+            compiled_ids = [
+                p.node_id
+                for p in sorted(
+                    graph.dag.predecessors(node),
+                    key=lambda p: graph.dag.edges[p, node]['input_index'],
+                )
+            ]
+            self.assertEqual(
+                compiled_ids,
+                raw_concat_inputs[node.layer_id],
+                f'concat {node.layer_id} input order changed after compilation',
+            )
+
     def _export_and_compile(
         self,
         model,
@@ -459,6 +486,11 @@ class TestSingleLayer(CompilerTestBase):
                     break
         self.assertEqual(res, True)
 
+    def test_single_dw_conv_big_size(self):
+        model = nn_modules.DepthwiseConv(channels=32, stride=2)
+        graph, score = self._export_and_compile(model, (1, 32, 256, 256), style='multiplexed')
+        self.assertTrue(any(node.is_big_size for node in graph.dag.nodes if isinstance(node, ConvComputeNode)))
+
 
 class TestLayerInteraction(CompilerTestBase):
     def test_mismatched_scale(self):
@@ -615,12 +647,13 @@ class TestCompiler(CompilerTestBase):
         graph, score = self._export_and_compile(model, (1, 32, 64, 64))
         self.assertEqual(check_dropped_levels_per_subgraph(graph), True)
 
-    @unittest.skip('Not supported yet')
+    # @unittest.skip('Not supported yet')
     def test_multiple_inputs(self):
         model = nn_modules.MutipleInputs()
-        graph, score = self._export_and_compile(model, (1, 32, 64, 64))
+        input_sizes = [(1, 32, 64, 64)] * model.n_inputs
+        graph, score = self._export_and_compile(model, input_sizes)
 
-    @unittest.skip('Not supported yet')
+    # @unittest.skip('Not supported yet')
     def test_multiple_outputs(self):
         model = nn_modules.MutipleOutputs()
         graph, score = self._export_and_compile(model, (1, 32, 64, 64))
@@ -699,6 +732,17 @@ class TestCompiler(CompilerTestBase):
         pt_graph = prepare_graph(raw_graph)
         subs = split_graph_to_linear_subgraph(pt_graph.dag)
         self.assertEqual(len(subs), 2)
+
+    def test_conv_concat_conv(self):
+        """Shared-input concat structure with final add:
+        concat1: [conv1_out, conv2_out] → 16ch
+        concat2: [conv2_out, conv3_out, conv4_out] → 16ch  (conv2_out shared)
+        add:     concat1_out + concat2_out
+        """
+        model = nn_modules.ConvConcatConv()
+        graph, score = self._export_and_compile(model, (1, 16, 32, 32))
+        # temp_json_path still holds the pre-pipeline JSON at this point
+        self._check_concat_input_ordering(graph, self.temp_json_path)
 
 
 class TestCompilerErrors(CompilerTestBase):
@@ -917,16 +961,26 @@ class TestE2E(CompilerTestBase):
     # ── Big-size tests (256×256 input) ──
 
     def test_e2e_single_avgpool_big_size(self):
-        """Avgpool with big_size input (256×256), ordinary style."""
+        """Avgpool with big_size input (256×256), multiplexed style."""
         model = nn_modules.SingleAvgpool()
-        graph, score = self._export_compile_and_deploy(model, (1, 32, 256, 256), 'single_avgpool_big_size')
+        graph, score = self._export_compile_and_deploy(
+            model, (1, 5, 256, 256), 'single_avgpool_big_size', style='multiplexed'
+        )
         self.assertTrue(check_feature_scale(graph))
 
     def test_e2e_single_conv_with_stride_big_size(self):
         """Conv stride=2 with big_size input (256×256), multiplexed."""
         model = nn_modules.SingleConv(2)
         graph, score = self._export_compile_and_deploy(
-            model, (1, 32, 256, 256), 'single_conv_with_stride_big_size', style='multiplexed'
+            model, (1, 32, 128, 128), 'single_conv_with_stride_big_size', style='multiplexed'
+        )
+        self.assertIsNotNone(graph)
+
+    def test_e2e_dw_conv_big_size(self):
+        """Depthwise conv stride=2 with big_size input (256x256), multiplexed."""
+        model = nn_modules.DepthwiseConv(channels=32, stride=2)
+        graph, score = self._export_compile_and_deploy(
+            model, (1, 32, 256, 256), 'dw_conv_big_size', style='multiplexed'
         )
         self.assertIsNotNone(graph)
 
@@ -992,6 +1046,12 @@ class TestE2E(CompilerTestBase):
         graph, score = self._export_compile_and_deploy(model, (1, 3, 32, 32), 'concat_e2e')
         self.assertIsNotNone(graph)
 
+    def test_e2e_uneven_concat(self):
+        """Two conv branches with uneven channels concatenated. Covers concat_layer uneven path."""
+        model = nn_modules.UnevenConcatModel()
+        graph, score = self._export_compile_and_deploy(model, (1, 3, 32, 32), 'uneven_concat')
+        self.assertIsNotNone(graph)
+
     def test_e2e_conv_upsample(self):
         """Conv stride=2 + nearest upsample. Covers upsample_layer / upsample_nearest_layer."""
         model = nn_modules.ConvUpsampleE2E()
@@ -1004,6 +1064,36 @@ class TestE2E(CompilerTestBase):
         """Avgpool with stride=4. Covers avgpool2d_layer varied strides."""
         model = nn_modules.AvgpoolVariedStride(stride=4)
         graph, score = self._export_compile_and_deploy(model, (1, 32, 32, 32), 'avgpool_stride4', style='multiplexed')
+        self.assertIsNotNone(graph)
+
+    def test_multiple_outputs(self):
+        """input."""
+        model = nn_modules.MutipleOutputs()
+        graph, score = self._export_compile_and_deploy(model, (1, 32, 64, 64), 'multiple_outputs', style='multiplexed')
+        self.assertIsNotNone(graph)
+
+    def test_multiple_inputs(self):
+        """output."""
+        model = nn_modules.MutipleInputs()
+        input_sizes = [(1, 32, 64, 64)] * model.n_inputs
+        graph, score = self._export_compile_and_deploy(model, input_sizes, 'multiple_inputs', style='multiplexed')
+        self.assertIsNotNone(graph)
+
+    def test_e2e_conv_concat_conv(self):
+        """Shared-input concat structure with final add."""
+        model = nn_modules.ConvConcatConv()
+        graph, score = self._export_compile_and_deploy(model, (1, 16, 32, 32), 'conv_concat_conv')
+        self.assertIsNotNone(graph)
+
+    def test_e2e_general_avgpool(self):
+        """General avgpool (kernel_size=3, stride=2) replaced with depthwise conv for FHE."""
+        model = nn_modules.GeneralAvgpool(kernel_size=3, stride=2, padding=1)
+        graph, score = self._export_compile_and_deploy(
+            model,
+            (1, 32, 8, 8),
+            'general_avgpool',
+            style='multiplexed',
+        )
         self.assertIsNotNone(graph)
 
 

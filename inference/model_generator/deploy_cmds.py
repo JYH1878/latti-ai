@@ -31,6 +31,7 @@ from inference.model_generator.layers.conv2d_depthwise import *
 from inference.model_generator.layers.conv2d_packed_layer import *
 from inference.model_generator.layers.dense_packed_layer import *
 from inference.model_generator.layers.inverse_multiplexed_conv2d_layer import *
+from inference.model_generator.layers.inverse_multiplexed_depthwise_conv2d_layer import *
 from inference.model_generator.layers.mult_scaler import *
 from inference.model_generator.layers.multiplexed_conv1d_pack_layer import *
 from inference.model_generator.layers.multiplexed_conv2d_pack_layer import *
@@ -85,6 +86,21 @@ def gen_custom_task(task_path, param_name='PN14QP438', use_gpu=True, style='ordi
     feature_id_to_nodes_map = {}
     task_output_feature_ids = config_info['output_feature']
 
+    # Pre-add all graph-level input ciphertexts first so they precede weights in input_args.
+    # This ensures the C++ signature position-matching works correctly for multi-input models.
+    # Only needed when there are multiple graph-level inputs; single-input models are handled
+    # correctly by the lazy-loading in the main loop (which also computes the right CT count
+    # for big_size layers).
+    if len(config_info['input_feature']) > 1:
+        for input_fid in config_info['input_feature']:
+            feat = config_info['feature'][input_fid]
+            pack = int(feat['pack_num'])
+            level = int(feat['level'])
+            n_packed = math.ceil(int(feat['channel']) / pack)
+            x = [CkksCiphertextNode(input_fid + f'input{k}', level=level) for k in range(n_packed)]
+            feature_id_to_nodes_map[input_fid] = x
+            input_args.append(Argument(input_fid, x))
+
     for layer_id, layer_config in config_info['layer'].items():
         if layer_config['type'] == 'relu2d':
             continue
@@ -103,10 +119,12 @@ def gen_custom_task(task_path, param_name='PN14QP438', use_gpu=True, style='ordi
             n_packed_in_channel = math.ceil(n_in_channel / 8192)
             n_packed_out_channel = math.ceil(n_out_channel / pack)
 
-        # For big_conv/big_avgpool, input CT count differs from the default n_packed_in_channel
-        if (layer_config['type'] == 'conv2d' or 'avgpool' in layer_config['type']) and layer_config.get(
-            'is_big_size', False
-        ):
+        # For big_conv/big_avgpool/big_mult_scalar, input CT count differs from the default n_packed_in_channel
+        if (
+            layer_config['type'] == 'conv2d'
+            or 'avgpool' in layer_config['type']
+            or layer_config['type'] == 'mult_scalar'
+        ) and layer_config.get('is_big_size', False):
             input_shape = config_info['feature'][layer_input_feature_ids[0]]['shape']
             block_expansion = (
                 math.ceil(input_shape[0] / block_shape[0]),
@@ -135,28 +153,48 @@ def gen_custom_task(task_path, param_name='PN14QP438', use_gpu=True, style='ordi
             next_stride = [block_expansion[0] // stride[0], block_expansion[1] // stride[1]]
             padding = [-1, -1]
             if is_big_conv:
-                big_conv = InverseMultiplexedConv2DLayer(
-                    n_out_channel,
-                    n_in_channel,
-                    input_shape,
-                    padding,
-                    kernel_shape,
-                    stride,
-                    next_stride,
-                    skip,
-                    block_shape,
-                )
+                if groups == n_out_channel and groups != 1:
+                    big_conv = InverseMultiplexedDepthwiseConv2DLayer(
+                        n_out_channel,
+                        input_shape,
+                        padding,
+                        kernel_shape,
+                        stride,
+                        next_stride,
+                        skip,
+                        block_shape,
+                    )
 
-                weight_pt = [
-                    [
+                    weight_pt = [
                         [
-                            CkksPlaintextRingtNode(f'convw_{layer_id}_{k}_{n}_{i}')
+                            CkksPlaintextRingtNode(f'convw_{layer_id}_{k}_{i}')
                             for i in range(int(index * next_stride[0] * next_stride[1]))
                         ]
-                        for n in range(n_in_channel)
+                        for k in range(n_out_channel)
                     ]
-                    for k in range(n_out_channel)
-                ]
+                else:
+                    big_conv = InverseMultiplexedConv2DLayer(
+                        n_out_channel,
+                        n_in_channel,
+                        input_shape,
+                        padding,
+                        kernel_shape,
+                        stride,
+                        next_stride,
+                        skip,
+                        block_shape,
+                    )
+
+                    weight_pt = [
+                        [
+                            [
+                                CkksPlaintextRingtNode(f'convw_{layer_id}_{k}_{n}_{i}')
+                                for i in range(int(index * next_stride[0] * next_stride[1]))
+                            ]
+                            for n in range(n_in_channel)
+                        ]
+                        for k in range(n_out_channel)
+                    ]
 
                 bias_pt = [CkksPlaintextRingtNode(f'convb_{layer_id}_{i}') for i in range(n_out_channel)]
 
@@ -402,11 +440,37 @@ def gen_custom_task(task_path, param_name='PN14QP438', use_gpu=True, style='ordi
             feature_id_to_nodes_map.update({layer_output_feature_ids[0]: layer_output_nodes})
 
         elif 'concat2d' in layer_config['type']:
-            # concat is a runtime-only operation: just merge node lists from all inputs
-            layer_output_nodes = []
+            # Check if any input has n_channel not divisible by n_channel_per_ct
+            input_n_channels = []
+            has_uneven = False
             for input_fid in layer_input_feature_ids:
-                layer_output_nodes.extend(feature_id_to_nodes_map[input_fid])
-            feature_id_to_nodes_map.update({layer_output_feature_ids[0]: layer_output_nodes})
+                feat = config_info['feature'][input_fid]
+                n_ch = int(feat['channel'])
+                input_n_channels.append(n_ch)
+                if n_ch % pack != 0:
+                    has_uneven = True
+
+            if has_uneven:
+                # Uneven path: per-channel mask+rotate+add
+                concat_layer = ConcatLayer()
+                input_node_lists = [feature_id_to_nodes_map[fid] for fid in layer_input_feature_ids]
+                input_shape = config_info['feature'][layer_input_feature_ids[0]]['shape']
+                total_channels = sum(input_n_channels)
+
+                # Create mask plaintext nodes for each global channel
+                mask_pts = [CkksPlaintextRingtNode(f'concat_mask_{layer_id}_{i}') for i in range(total_channels)]
+
+                layer_output_nodes = concat_layer.call_multiple_inputs_uneven(
+                    input_node_lists, input_n_channels, pack, input_shape, skip, mask_pts
+                )
+                feature_id_to_nodes_map.update({layer_output_feature_ids[0]: layer_output_nodes})
+                input_args.append(Argument(f'concat_mask_{layer_id}', mask_pts))
+            else:
+                # Fast path: concat is a runtime-only operation, just merge node lists
+                layer_output_nodes = []
+                for input_fid in layer_input_feature_ids:
+                    layer_output_nodes.extend(feature_id_to_nodes_map[input_fid])
+                feature_id_to_nodes_map.update({layer_output_feature_ids[0]: layer_output_nodes})
 
         elif 'upsample_nearest' in layer_config['type']:
             input_shape = config_info['feature'][layer_input_feature_ids[0]]['shape']
@@ -444,7 +508,7 @@ def gen_custom_task(task_path, param_name='PN14QP438', use_gpu=True, style='ordi
                     math.ceil(input_shape[1] / block_shape[1]),
                 ]
                 layer_output_nodes = avgpool.call_interleaved_avgpool(
-                    feature_id_to_nodes_map[layer_input_feature_ids[0]], block_expansion
+                    feature_id_to_nodes_map[layer_input_feature_ids[0]], block_expansion, N=n
                 )
             else:
                 if is_adaptive:
