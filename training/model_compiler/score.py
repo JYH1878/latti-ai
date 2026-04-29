@@ -244,6 +244,20 @@ add_time = {
 
 btp_time = {'8192': 7, '16384': 12, '65536': 24}
 
+# Sparse-packing bootstrapping discount factor derived from benchmark:
+# Sparse (H=192/H=32) is ~2.85x faster than Dense (H=N/2).
+# We use a conservative 0.40 discount for the compiler score.
+SPARSE_BTP_DISCOUNT = 0.40
+
+def is_sparse_bootstrapping_param(param_name: str) -> bool:
+    """Heuristic: parameter names with H=192 or H=768 + ephemeral H=32 are sparse."""
+    if not param_name:
+        return False
+    # N16QP1546H192H32, N16QP1547H192H32, N16QP1553H192H32, N15QP768H192H32
+    if 'H192H32' in param_name or 'H768H32' in param_name:
+        return True
+    return False
+
 mpc_refresh_rate = 1 / 15
 ct_trans_rate = 1 / 10
 
@@ -507,9 +521,14 @@ class BtpScoreParam:
         graph.dag = dag
         pred = list(graph.dag.predecessors(compute_node))[0]
         self.n = param[pred.ckks_parameter_id].poly_modulus_degree
+        self.param_name = param[pred.ckks_parameter_id].name
         pack_num = graph.dag.nodes[pred]['pack_num']
         self.ct_num = math.ceil(compute_node.channel_input / pack_num)
 
     def get_score(self):
-        score = self.ct_num * btp_time[str(self.n)] / get_multithread_rate_for_btp(self.ct_num)
+        base_time = btp_time[str(self.n)]
+        # Apply sparse-packing discount when using SSE parameters
+        if is_sparse_bootstrapping_param(self.param_name):
+            base_time = base_time * SPARSE_BTP_DISCOUNT
+        score = self.ct_num * base_time / get_multithread_rate_for_btp(self.ct_num)
         return score

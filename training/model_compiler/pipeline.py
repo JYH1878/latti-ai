@@ -18,7 +18,7 @@
 from pathlib import Path
 
 import components
-from components import LayerAbstractGraph, config, PN13QP218, PN14QP438, PN15QP880, PN16QP1761, N16QP1546H192H32
+from components import LayerAbstractGraph, config, PN13QP218, PN14QP438, PN15QP880, PN16QP1761, N16QP1546H192H32, N16QP1547H192H32
 import processor
 from processor import *
 from graph_partition_dp import *
@@ -129,7 +129,7 @@ def try_btp(
     temperature: float,
     num_workers: int,
 ) -> tuple[bool, LayerAbstractGraph | None, float]:
-    btp_param_list = [N16QP1546H192H32]
+    btp_param_list = [N16QP1546H192H32, N16QP1547H192H32]
     valid_results = []
     for params in btp_param_list:
         config.fhe_param = params

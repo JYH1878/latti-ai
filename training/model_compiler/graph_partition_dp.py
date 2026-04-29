@@ -198,7 +198,16 @@ class GraphPartitioner:
 
         max_depth = max(subgraphs_in_depths.keys())
 
-        level_threshold = max_depth - 4
+        # Adjust threshold based on bootstrapping parameter characteristics.
+        # Sparse-packing parameters (H=192/H=32) save ~4 modulus levels and
+        # bootstrap ~2.85x faster, so we can afford to explore more subgraph
+        # candidates (smaller threshold gap) to find better placement.
+        from components import config
+        param_name = getattr(config.fhe_param, 'name', '')
+        if 'H192H32' in param_name or 'H768H32' in param_name:
+            level_threshold = max_depth - 6
+        else:
+            level_threshold = max_depth - 4
         depths = []
         for i, depth in enumerate(sorted(list(subgraphs_in_depths.keys()), reverse=True)):
             if i > 0 and depth < level_threshold:

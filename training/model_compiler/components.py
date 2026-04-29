@@ -257,6 +257,50 @@ N16QP1546H192H32 = FheParameter(
 )
 
 
+# N16QP1547H192H32: LogN=16, logQP≈1547, sparse secret H=192, ephemeral H=32
+# Q: 1×60-bit Q0 + 4×45-bit residual + 18 bootstrapping primes, P: 4×61-bit
+# Residual Q : 285 bits. Precision : 32.1 bits for 2^15 slots.
+N16QP1547H192H32 = FheParameter(
+    name='N16QP1547H192H32',
+    poly_modulus_degree=65536,
+    max_level=9,
+    log_default_scale=45,
+    q=[
+        0x10000000006E0001,  # 60  Q0
+        0x2000000A0001,     # 45  residual
+        0x2000000E0001,     # 45  residual
+        0x1FFFFFC20001,     # 45  residual
+        0x200000440001,     # 45  residual
+        0x200000500001,     # 45  residual
+        0x3FFFFE80001,      # 42  StC
+        0x3FFFFD20001,      # 42  StC
+        0x3FFFFCA0001,      # 42  StC
+        0xFFFFFFFFFFC0001,  # 60  ArcSine
+        0xFFFFFFFFF240001,  # 60  ArcSine
+        0x1000000000F00001, # 60  ArcSine
+        0xFFFFFFFFF840001,  # 60  Double angle
+        0x1000000000860001, # 60  Double angle
+        0xFFFFFFFFF6A0001,  # 60  Sine
+        0x1000000000980001, # 60  Sine
+        0xFFFFFFFFF5A0001,  # 60  Sine
+        0x1000000000B00001, # 60  Sine
+        0x1000000000CE0001, # 60  Sine
+        0xFFFFFFFFF2A0001,  # 60  Sine
+        0x400000000360001,  # 58  CtS
+        0x3FFFFFFFFBE0001,  # 58  CtS
+        0x400000000660001,  # 58  CtS
+        0x4000000008A0001,  # 58  CtS
+    ],
+    p=[
+        0x1FFFFFFFFFE00001,
+        0x1FFFFFFFFFC80001,
+        0x1FFFFFFFFFB40001,
+        0x1FFFFFFFFF500001,
+    ],
+    n_slots=1 << 15,
+)
+
+
 class GlobalConfig:
     _instance = None
 
